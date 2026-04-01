@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastmcp import FastMCP
 
 from app.tools.db import close_pool, init_pool
+from app.tools.geocode import geocode_location
 from app.tools.search import get_service_details, search_services
 
 logging.basicConfig(
@@ -26,6 +27,7 @@ mcp = FastMCP("shelter-search", lifespan=lifespan)
 
 mcp.add_tool(search_services)
 mcp.add_tool(get_service_details)
+mcp.add_tool(geocode_location)
 
 # Entry point for uvicorn:
 # uvicorn app.server:http_app --host 0.0.0.0 --port 8001
