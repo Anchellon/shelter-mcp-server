@@ -1,4 +1,5 @@
 import logging
+import math
 
 from app.config import settings
 from app.embeddings import embed_query
@@ -9,58 +10,208 @@ logger = logging.getLogger(__name__)
 # Fields returned to the LLM — deliberately excludes embedding and embedding_text
 # to keep context window usage low. Claude doesn't need the raw prose or vector.
 _SEARCH_FIELDS = [
-    "id",
     "service_id",
-    "resource_id",
     "latitude",
     "longitude",
-    "category_names",
-    "parent_category_names",
-    "sfsg_category_names",
-    "ucsf_top_category_names",
-    "ucsf_sub_category_names",
-    "our415_category_names",
-    "eligibility_age",
-    "eligibility_gender",
-    "eligibility_housing",
-    "eligibility_health",
-    "eligibility_financial",
-    "eligibility_immigration",
-    "eligibility_all",
     "schedule",
+    "category_names",
+    "sfsg_category_names",
+    "eligibility_age",
+    "eligibility_employment",
+    "eligibility_ethnicity",
+    "eligibility_family_status",
+    "eligibility_financial",
+    "eligibility_gender",
+    "eligibility_health",
+    "eligibility_immigration",
+    "eligibility_housing",
+    "eligibility_other",
+    "eligibility_all",
+    "embedding_text",
 ]
 
 # Details include the prose text for a single service
 _DETAIL_FIELDS = _SEARCH_FIELDS + ["embedding_text"]
 
 
-async def search_services(query: str, limit: int = 5) -> list[dict]:
+def _parse_when(when: str) -> tuple[str, int] | None:
+    """
+    Parse 'Monday 14:00' → ('Monday', 840).
+    Returns None if unparseable.
+    """
+    try:
+        parts = when.strip().split()
+        day = parts[0].capitalize()
+        h, m = parts[1].split(":")
+        return day, int(h) * 60 + int(m)
+    except Exception:
+        return None
+
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in km between two lat/lng points."""
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+_MAX_RADIUS_KM = 50.0
+_MAX_RESULTS = 50
+
+
+async def search_services(
+    query: str,
+    categories: list[str] | None = None,
+    eligibilities: list[str] | None = None,
+    lat: float | None = None,
+    lng: float | None = None,
+    when: str | None = None,
+) -> list[dict]:
     """
     Semantic similarity search for social services matching the user's need.
-    Returns up to `limit` services ranked by relevance to the query.
-    Each result includes category, eligibility, location, and schedule metadata.
-    Do not include raw embeddings or prose text — use get_service_details for full detail.
+    Returns all services within 50km with similarity score < 0.7, sorted by:
+      1. category match (service has the requested category)
+      2. eligibility match (service eligibility overlaps with requested)
+      3. distance ascending
+    All results are returned — no hard filters on category or eligibility.
     """
-    logger.info(f"search_services: query='{query[:80]}', limit={limit}")
+    logger.info(f"search_services: query='{query[:80]}', categories={categories}, eligibilities={eligibilities}, lat={lat}, lng={lng}")
     vector = await embed_query(query)
     pool = await get_pool()
 
     fields = ", ".join(_SEARCH_FIELDS)
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT {fields}
+
+    cat_match = "(CASE WHEN $2::text[] IS NOT NULL AND sfsg_category_names && $2::text[] THEN 1 ELSE 0 END)"
+    elig_match = "(CASE WHEN $3::text[] IS NOT NULL AND eligibility_all && $3::text[] THEN 1 ELSE 0 END)"
+
+    dist_expr = f"({lat} - latitude::float8)^2 + ({lng} - longitude::float8)^2" if lat is not None and lng is not None else "0"
+
+    # Schedule filter — only apply if when is provided
+    parsed_when = _parse_when(when) if when else None
+    if parsed_when:
+        when_day, when_mins = parsed_when
+        schedule_filter = f"""
+            AND (
+                schedule IS NULL
+                OR jsonb_array_length(schedule) = 0
+                OR EXISTS (
+                    SELECT 1 FROM jsonb_array_elements(schedule) e
+                    WHERE e->>'day' = '{when_day}'
+                    AND (e->>'open_mins')::int <= {when_mins}
+                    AND (e->>'close_mins')::int >= {when_mins}
+                )
+            )
+        """
+    else:
+        schedule_filter = ""
+
+    sql = f"""
+        SELECT DISTINCT ON (service_id) {fields},
+               {cat_match} AS category_match,
+               {elig_match} AS eligibility_match
+        FROM (
+            SELECT *
             FROM {settings.pgvector_table}
+            WHERE embedding <=> $1::vector < 0.7 {schedule_filter}
             ORDER BY embedding <=> $1::vector
-            LIMIT $2
-            """,
-            str(vector),
-            limit,
-        )
+        ) ranked
+        ORDER BY service_id{f', {dist_expr}' if lat is not None and lng is not None else ''}
+    """
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, str(vector), categories or None, eligibilities or None)
 
     results = [dict(r) for r in rows]
+
+    # Attach distance_km
+    for r in results:
+        r_lat = r.get("latitude")
+        r_lng = r.get("longitude")
+        if lat is not None and lng is not None and r_lat is not None and r_lng is not None:
+            r["distance_km"] = round(_haversine_km(lat, lng, float(r_lat), float(r_lng)), 2)
+        else:
+            r["distance_km"] = None
+
+    # Region filter
+    if lat is not None and lng is not None:
+        results = [r for r in results if r["distance_km"] is not None and r["distance_km"] <= _MAX_RADIUS_KM]
+
+
+    # Sort: category_match DESC, eligibility_match DESC, distance ASC
+    results.sort(key=lambda r: (
+        -r["category_match"],
+        -r["eligibility_match"],
+        r["distance_km"] if r["distance_km"] is not None else float("inf"),
+    ))
+
+    results = results[:_MAX_RESULTS]
     logger.info(f"search_services: returned {len(results)} results")
     return results
+
+
+async def list_categories() -> list[str]:
+    """
+    Returns the available top-level service categories.
+    Use this to map a user's 'what' to a known category before searching.
+    """
+    return [
+        "sfsg-domesticviolence",
+        "sfsg-health",
+        "sfsg-finance",
+        "sfsg-food",
+        "sfsg-housing",
+        "sfsg-hygiene",
+        "sfsg-internet",
+        "sfsg-jobs",
+        "sfsg-lgbtqa",
+        "sfsg-substanceuse",
+        "sfsg-shelter",
+        "sfsg-longterm",
+        "sfsg-familyservices",
+    ]
+
+
+async def list_eligibilities() -> dict[str, list[str]]:
+    """
+    Returns eligible population values grouped by dimension.
+    Use this to map a user's 'who' to known eligibility values before searching.
+    """
+    return {
+        "age": [
+            "All Ages", "Infants", "Toddlers", "Children", "Teens",
+            "Transitional Aged Youth (TAY)", "Adults", "Senior",
+        ],
+        "housing": [
+            "Home Owners", "Home Renters", "Experiencing Homelessness",
+            "In Jail", "Near Homeless",
+        ],
+        "gender": ["LGBTQ+", "Men", "Women"],
+        "family_status": [
+            "Individuals", "Single Parent", "Married no children",
+            "Families with children below 18 years old",
+        ],
+        "employment": ["Employed", "Retired", "Veterans", "Unemployed"],
+        "financial": ["Low-Income", "Uninsured"],
+        "health": [
+            "HIV/AIDS", "Pregnant", "Special Needs/Disabilities", "Substance Dependency",
+            "Visual Impairment", "Deaf or Hard of Hearing",
+        ],
+        "ethnicity": [
+            "African/Black", "API (Asian/Pacific Islander)", "Chinese", "Filipino/a",
+            "Jewish", "Latinx", "Middle Eastern and North African",
+            "Native American", "Pacific Islander", "Samoan",
+        ],
+        "immigration": ["Immigrants", "Undocumented"],
+        "other": [
+            "Anyone in Need", "Disaster Victim", "Domestic Violence Survivors",
+            "Gender-Based Violence", "Human Trafficking Survivors",
+            "San Francisco Residents", "Sexual Assault Survivors",
+            "Trauma Survivors", "Abuse or Neglect Survivors",
+        ],
+    }
 
 
 async def get_service_details(service_id: int) -> dict | None:
