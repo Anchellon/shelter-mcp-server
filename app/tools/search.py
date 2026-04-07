@@ -214,6 +214,71 @@ async def list_eligibilities() -> dict[str, list[str]]:
     }
 
 
+async def get_service_details_batch(service_ids: list[int]) -> list[dict]:
+    """
+    Returns card-level details for a batch of services by their service_ids.
+    Each result includes: service_id, name, long_description, org_name,
+    address_1, city, state_province, postal_code, latitude, longitude, phone.
+    Address prefers service-level (via addresses_services join table), falling
+    back to resource-level. Phone is the first phone on the resource.
+    """
+    if not service_ids:
+        return []
+
+    logger.info(f"get_service_details_batch: {len(service_ids)} service_ids")
+    pool = await get_pool()
+
+    sql = """
+        SELECT
+            s.id                                                AS service_id,
+            s.name,
+            s.long_description,
+            r.id                                                AS resource_id,
+            r.name                                              AS org_name,
+            COALESCE(sa.address_1,    ra.address_1)            AS address_1,
+            COALESCE(sa.city,         ra.city)                 AS city,
+            COALESCE(sa.state_province, ra.state_province)     AS state_province,
+            COALESCE(sa.postal_code,  ra.postal_code)          AS postal_code,
+            COALESCE(sa.latitude,     ra.latitude)             AS latitude,
+            COALESCE(sa.longitude,    ra.longitude)            AS longitude,
+            p.number                                            AS phone
+        FROM services s
+        JOIN resources r ON r.id = s.resource_id
+        LEFT JOIN LATERAL (
+            SELECT a.address_1, a.city, a.state_province, a.postal_code,
+                   a.latitude, a.longitude
+            FROM addresses a
+            JOIN addresses_services ads ON a.id = ads.address_id
+            WHERE ads.service_id = s.id
+            ORDER BY a.id
+            LIMIT 1
+        ) sa ON true
+        LEFT JOIN LATERAL (
+            SELECT address_1, city, state_province, postal_code,
+                   latitude, longitude
+            FROM addresses
+            WHERE resource_id = r.id
+            ORDER BY id
+            LIMIT 1
+        ) ra ON true
+        LEFT JOIN LATERAL (
+            SELECT number
+            FROM phones
+            WHERE resource_id = r.id
+            ORDER BY id
+            LIMIT 1
+        ) p ON true
+        WHERE s.id = ANY($1::int[])
+    """
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, service_ids)
+
+    results = [dict(r) for r in rows]
+    logger.info(f"get_service_details_batch: returned {len(results)} results")
+    return results
+
+
 async def get_service_details(service_id: int) -> dict | None:
     """
     Returns full details for a specific service by its service_id, including

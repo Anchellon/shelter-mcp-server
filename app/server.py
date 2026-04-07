@@ -5,7 +5,7 @@ from fastmcp import FastMCP
 
 from app.tools.db import close_pool, init_pool
 from app.tools.geocode import geocode_location
-from app.tools.search import get_service_details, list_categories, list_eligibilities, search_services
+from app.tools.search import get_service_details, get_service_details_batch, list_categories, list_eligibilities, search_services
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,6 +27,7 @@ mcp = FastMCP("shelter-search", lifespan=lifespan)
 
 mcp.add_tool(search_services)
 mcp.add_tool(get_service_details)
+mcp.add_tool(get_service_details_batch)
 mcp.add_tool(geocode_location)
 mcp.add_tool(list_categories)
 mcp.add_tool(list_eligibilities)
