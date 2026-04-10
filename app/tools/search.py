@@ -72,10 +72,11 @@ async def search_services(
 ) -> list[dict]:
     """
     Semantic similarity search for social services matching the user's need.
-    Returns all services within 50km with similarity score < 0.7, sorted by:
-      1. category match (service has the requested category)
-      2. eligibility match (service eligibility overlaps with requested)
-      3. distance ascending
+    Returns all services within 50km with cosine distance < 0.5, sorted by:
+      1. similarity score (primary) — with small tag nudges applied
+      2. category match nudge: -0.10 applied to score if service has requested category
+      3. eligibility match nudge: -0.05 applied to score if eligibility overlaps
+      4. distance ascending as tiebreaker
     All results are returned — no hard filters on category or eligibility.
     """
     logger.info(f"search_services: query='{query[:80]}', categories={categories}, eligibilities={eligibilities}, lat={lat}, lng={lng}")
@@ -111,12 +112,13 @@ async def search_services(
     sql = f"""
         SELECT DISTINCT ON (service_id) {fields},
                {cat_match} AS category_match,
-               {elig_match} AS eligibility_match
+               {elig_match} AS eligibility_match,
+               similarity
         FROM (
-            SELECT *
+            SELECT *, embedding <=> $1::vector AS similarity
             FROM {settings.pgvector_table}
-            WHERE embedding <=> $1::vector < 0.7 {schedule_filter}
-            ORDER BY embedding <=> $1::vector
+            WHERE embedding <=> $1::vector < 0.5 {schedule_filter}
+            ORDER BY similarity
         ) ranked
         ORDER BY service_id{f', {dist_expr}' if lat is not None and lng is not None else ''}
     """
@@ -140,10 +142,9 @@ async def search_services(
         results = [r for r in results if r["distance_km"] is not None and r["distance_km"] <= _MAX_RADIUS_KM]
 
 
-    # Sort: category_match DESC, eligibility_match DESC, distance ASC
+    # Sort: similarity as primary signal, with tag nudges and distance as tiebreaker
     results.sort(key=lambda r: (
-        -r["category_match"],
-        -r["eligibility_match"],
+        r["similarity"] - (0.10 * r["category_match"]) - (0.05 * r["eligibility_match"]),
         r["distance_km"] if r["distance_km"] is not None else float("inf"),
     ))
 
