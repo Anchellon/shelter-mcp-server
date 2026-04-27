@@ -58,7 +58,8 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return R * 2 * math.asin(math.sqrt(a))
 
 
-_MAX_RADIUS_KM = 50.0
+_DEFAULT_RADIUS_FT = 2500.0
+_FT_TO_KM = 0.0003048  # 1 ft = 0.3048 m = 0.0003048 km
 _MAX_RESULTS = 50
 
 
@@ -68,11 +69,13 @@ async def search_services(
     eligibilities: list[str] | None = None,
     lat: float | None = None,
     lng: float | None = None,
+    radius_ft: float = _DEFAULT_RADIUS_FT,
     when: str | None = None,
 ) -> list[dict]:
     """
     Semantic similarity search for social services matching the user's need.
-    Returns all services within 50km with cosine distance < 0.5, sorted by:
+    When lat/lng are provided, results are restricted to within radius_ft feet
+    (default 2500 ft ≈ 0.76 km). Results are sorted by:
       1. similarity score (primary) — with small tag nudges applied
       2. category match nudge: -0.10 applied to score if service has requested category
       3. eligibility match nudge: -0.05 applied to score if eligibility overlaps
@@ -137,9 +140,10 @@ async def search_services(
         else:
             r["distance_km"] = None
 
-    # Region filter
+    # Region filter — restrict to radius_ft when coordinates are provided
     if lat is not None and lng is not None:
-        results = [r for r in results if r["distance_km"] is not None and r["distance_km"] <= _MAX_RADIUS_KM]
+        radius_km = radius_ft * _FT_TO_KM
+        results = [r for r in results if r["distance_km"] is not None and r["distance_km"] <= radius_km]
 
 
     # Sort: similarity as primary signal, with tag nudges and distance as tiebreaker
