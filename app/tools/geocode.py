@@ -17,20 +17,21 @@ _TIMEOUT = 5.0
 async def geocode_location(location_text: str) -> dict | None:
     """
     Converts a location string (neighborhood, zipcode, or address) to
-    latitude/longitude coordinates, scoped to San Francisco.
+    latitude/longitude coordinates. Prefers SF results via viewbox but
+    falls back globally so non-SF locations return real coordinates
+    (rather than None) — allowing the caller to do a deterministic
+    bounding-box check.
 
     Returns {lat, lng, display_name} or None if the location cannot be resolved.
     """
-    query = f"{location_text}, San Francisco, CA"
+    query = location_text
     logger.info(f"geocode_location: query='{query}'")
 
     params = {
         "q": query,
         "format": "json",
         "limit": 1,
-        "countrycodes": "us",
         "viewbox": _SF_VIEWBOX,
-        "bounded": 1,
     }
 
     try:
