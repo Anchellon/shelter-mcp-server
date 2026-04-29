@@ -20,9 +20,8 @@ class Settings(BaseSettings):
     db_pool_max: int = 10
     db_pool_timeout: float = 30.0
 
-    # Ollama
-    ollama_base_url: str = "http://172.26.64.1:11434"
-    ollama_embedding_model: str = "nomic-embed-text"
+    # Bedrock
+    bedrock_embedding_model: str = "amazon.titan-embed-text-v2:0"
 
 
 settings = Settings()

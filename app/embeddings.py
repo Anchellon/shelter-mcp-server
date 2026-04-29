@@ -1,26 +1,26 @@
 import logging
+import os
 
-from langchain_ollama import OllamaEmbeddings
+from langchain_aws import BedrockEmbeddings
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-_embeddings: OllamaEmbeddings | None = None
+_embeddings: BedrockEmbeddings | None = None
 
 
-def get_embeddings() -> OllamaEmbeddings:
+def get_embeddings() -> BedrockEmbeddings:
     global _embeddings
     if _embeddings is None:
-        _embeddings = OllamaEmbeddings(
-            base_url=settings.ollama_base_url,
-            model=settings.ollama_embedding_model,
+        _embeddings = BedrockEmbeddings(
+            model_id=settings.bedrock_embedding_model,
+            region_name=os.getenv("AWS_REGION", "us-east-1"),
         )
     return _embeddings
 
 
 async def embed_query(text: str) -> list[float]:
-    embeddings = get_embeddings()
-    vector = await embeddings.aembed_query(text)
+    vector = await get_embeddings().aembed_query(text)
     logger.debug(f"Embedded query (dim: {len(vector)})")
     return vector
