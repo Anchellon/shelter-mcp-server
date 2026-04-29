@@ -120,7 +120,7 @@ async def search_services(
         FROM (
             SELECT *, embedding <=> $1::vector AS similarity
             FROM {settings.pgvector_table}
-            WHERE embedding <=> $1::vector < 0.5 {schedule_filter}
+            WHERE embedding <=> $1::vector < 0.8 {schedule_filter}
             ORDER BY similarity
         ) ranked
         ORDER BY service_id{f', {dist_expr}' if lat is not None and lng is not None else ''}
