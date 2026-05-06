@@ -284,6 +284,77 @@ async def get_service_details_batch(service_ids: list[int]) -> list[dict]:
     return results
 
 
+async def search_by_name(name: str, limit: int = 10) -> list[dict]:
+    """
+    Look up services by organization or service name using a case-insensitive
+    partial match. Use this first when the navigator asks about a specific
+    named org (e.g. "Glide", "Compass Family", "St. Anthony's").
+    Returns up to `limit` results with full detail fields sorted by match quality.
+    """
+    logger.info(f"search_by_name: name='{name}', limit={limit}")
+    pool = await get_pool()
+
+    sql = """
+        SELECT
+            s.id                                                AS service_id,
+            s.name,
+            s.long_description,
+            r.id                                                AS resource_id,
+            r.name                                              AS org_name,
+            COALESCE(sa.address_1,    ra.address_1)            AS address_1,
+            COALESCE(sa.city,         ra.city)                 AS city,
+            COALESCE(sa.state_province, ra.state_province)     AS state_province,
+            COALESCE(sa.postal_code,  ra.postal_code)          AS postal_code,
+            COALESCE(sa.latitude,     ra.latitude)             AS latitude,
+            COALESCE(sa.longitude,    ra.longitude)            AS longitude,
+            p.number                                            AS phone
+        FROM services s
+        JOIN resources r ON r.id = s.resource_id
+        LEFT JOIN LATERAL (
+            SELECT a.address_1, a.city, a.state_province, a.postal_code,
+                   a.latitude, a.longitude
+            FROM addresses a
+            JOIN addresses_services ads ON a.id = ads.address_id
+            WHERE ads.service_id = s.id
+            ORDER BY a.id
+            LIMIT 1
+        ) sa ON true
+        LEFT JOIN LATERAL (
+            SELECT address_1, city, state_province, postal_code,
+                   latitude, longitude
+            FROM addresses
+            WHERE resource_id = r.id
+            ORDER BY id
+            LIMIT 1
+        ) ra ON true
+        LEFT JOIN LATERAL (
+            SELECT number
+            FROM phones
+            WHERE resource_id = r.id
+            ORDER BY id
+            LIMIT 1
+        ) p ON true
+        WHERE r.name ILIKE '%' || $1 || '%'
+           OR s.name ILIKE '%' || $1 || '%'
+        ORDER BY
+            CASE
+                WHEN r.name ILIKE $1        THEN 0
+                WHEN r.name ILIKE $1 || '%' THEN 1
+                WHEN r.name ILIKE '%' || $1 || '%' THEN 2
+                ELSE 3
+            END,
+            r.name, s.name
+        LIMIT $2
+    """
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, name, limit)
+
+    results = [dict(r) for r in rows]
+    logger.info(f"search_by_name: returned {len(results)} results for '{name}'")
+    return results
+
+
 async def get_service_details(service_id: int) -> dict | None:
     """
     Returns full details for a specific service by its service_id, including
