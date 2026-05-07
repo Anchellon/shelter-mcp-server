@@ -3,7 +3,7 @@ Integration tests for search tools.
 Requires a running pgvector DB and Ollama instance.
 Set env vars before running — see .env.example
 
-⚠️ These tests are currently broken — fix in a follow-up. Two issues:
+⚠️ These tests are currently broken — fix in a follow-up. Three issues:
 
 1. `search_services()` is called with `limit=N` in four tests below, but the
    function signature does not accept a `limit` keyword argument. Calls raise
@@ -19,6 +19,14 @@ Set env vars before running — see .env.example
    chat-api currently relies on embedding_text being present in search_services
    results, so removing it would be a cross-repo break — most likely the test
    should be updated, not the code.
+
+3. `test_get_service_details_includes_prose` asserts `"embedding_text" in
+   detail`. As of the prose-promotion PR, the unified detail tools no longer
+   return embedding_text — every prose field it contained is now exposed as
+   a structured column (long_description, fee, wait_time, required_documents,
+   interpretation_services, org_long_description, etc.). When fixing this
+   test, replace the assertion with checks for one of the new structured
+   prose fields (e.g. `assert "long_description" in detail`).
 
 TODO: triage and fix these in a dedicated PR. None of the production behaviour
 depends on these tests passing right now, but they are misleading as-is.
