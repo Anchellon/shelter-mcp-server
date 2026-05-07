@@ -2,6 +2,26 @@
 Integration tests for search tools.
 Requires a running pgvector DB and Ollama instance.
 Set env vars before running — see .env.example
+
+⚠️ These tests are currently broken — fix in a follow-up. Two issues:
+
+1. `search_services()` is called with `limit=N` in four tests below, but the
+   function signature does not accept a `limit` keyword argument. Calls raise
+   TypeError. The function caps internally at _MAX_RESULTS = 50 instead.
+   Either add a `limit` parameter to search_services, or drop the kwargs and
+   adjust assertions to match the internal cap.
+
+2. `test_search_services_returns_results` asserts `"embedding_text" not in
+   results[0]`, with a comment about "context window protection". But the
+   current `_SEARCH_FIELDS` in app/tools/search.py explicitly includes
+   `"embedding_text"` and search_services returns it. Either the code drifted
+   from the intended schema or the test is stale. format_results in shelter-
+   chat-api currently relies on embedding_text being present in search_services
+   results, so removing it would be a cross-repo break — most likely the test
+   should be updated, not the code.
+
+TODO: triage and fix these in a dedicated PR. None of the production behaviour
+depends on these tests passing right now, but they are misleading as-is.
 """
 import pytest
 
