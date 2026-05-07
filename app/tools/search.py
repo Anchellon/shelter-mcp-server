@@ -30,15 +30,18 @@ _SEARCH_FIELDS = [
     "embedding_text",
 ]
 
-def _build_detail_sql(where_clause: str) -> str:
+def _build_detail_sql(tail: str) -> str:
     """Build SQL for fetching unified per-service details.
 
     Joins services / resources / addresses (service-level then resource-level
     fallback) / phones / pgvector snapshot table so callers always receive the
-    same superset of fields regardless of whether they hit get_service_details
-    (singular) or get_service_details_batch. Card-style fields come from the
-    relational tables; filter/search fields and the prose come from the
-    snapshot table.
+    same superset of fields regardless of which entry point invoked the query
+    (get_service_details, get_service_details_batch, search_by_name).
+    Card-style fields come from the relational tables; filter/search fields
+    and the prose come from the snapshot table.
+
+    `tail` is appended after the FROM/JOIN block — at minimum a WHERE clause,
+    optionally followed by ORDER BY / LIMIT for callers that need them.
     """
     return f"""
         SELECT
@@ -96,7 +99,7 @@ def _build_detail_sql(where_clause: str) -> str:
             ORDER BY id
             LIMIT 1
         ) p ON true
-        WHERE {where_clause}
+        {tail}
     """
 
 
@@ -302,10 +305,44 @@ async def get_service_details_batch(service_ids: list[int]) -> list[dict]:
     pool = await get_pool()
 
     async with pool.acquire() as conn:
-        rows = await conn.fetch(_build_detail_sql("s.id = ANY($1::int[])"), service_ids)
+        rows = await conn.fetch(_build_detail_sql("WHERE s.id = ANY($1::int[])"), service_ids)
 
     results = [dict(r) for r in rows]
     logger.info(f"get_service_details_batch: returned {len(results)} results")
+    return results
+
+
+async def search_by_name(name: str, limit: int = 10) -> list[dict]:
+    """
+    Look up services by organization or service name using a case-insensitive
+    partial match. Use this first when the navigator asks about a specific
+    named org (e.g. "Glide", "Compass Family", "St. Anthony's").
+    Returns up to `limit` results with the same unified detail shape as
+    get_service_details / get_service_details_batch, sorted by match quality
+    (exact org name → prefix match → substring match).
+    """
+    logger.info(f"search_by_name: name='{name}', limit={limit}")
+    pool = await get_pool()
+
+    tail = """
+        WHERE r.name ILIKE '%' || $1 || '%'
+           OR s.name ILIKE '%' || $1 || '%'
+        ORDER BY
+            CASE
+                WHEN r.name ILIKE $1        THEN 0
+                WHEN r.name ILIKE $1 || '%' THEN 1
+                WHEN r.name ILIKE '%' || $1 || '%' THEN 2
+                ELSE 3
+            END,
+            r.name, s.name
+        LIMIT $2
+    """
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(_build_detail_sql(tail), name, limit)
+
+    results = [dict(r) for r in rows]
+    logger.info(f"search_by_name: returned {len(results)} results for '{name}'")
     return results
 
 
@@ -322,7 +359,7 @@ async def get_service_details(service_id: int) -> dict | None:
     pool = await get_pool()
 
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(_build_detail_sql("s.id = $1 LIMIT 1"), service_id)
+        row = await conn.fetchrow(_build_detail_sql("WHERE s.id = $1 LIMIT 1"), service_id)
 
     if row is None:
         logger.warning(f"get_service_details: service_id={service_id} not found")
