@@ -30,8 +30,74 @@ _SEARCH_FIELDS = [
     "embedding_text",
 ]
 
-# Details include the prose text for a single service
-_DETAIL_FIELDS = _SEARCH_FIELDS + ["embedding_text"]
+def _build_detail_sql(where_clause: str) -> str:
+    """Build SQL for fetching unified per-service details.
+
+    Joins services / resources / addresses (service-level then resource-level
+    fallback) / phones / pgvector snapshot table so callers always receive the
+    same superset of fields regardless of whether they hit get_service_details
+    (singular) or get_service_details_batch. Card-style fields come from the
+    relational tables; filter/search fields and the prose come from the
+    snapshot table.
+    """
+    return f"""
+        SELECT
+            s.id                                                  AS service_id,
+            s.name,
+            s.long_description,
+            r.id                                                  AS resource_id,
+            r.name                                                AS org_name,
+            COALESCE(sa.address_1,      ra.address_1)            AS address_1,
+            COALESCE(sa.city,           ra.city)                 AS city,
+            COALESCE(sa.state_province, ra.state_province)       AS state_province,
+            COALESCE(sa.postal_code,    ra.postal_code)          AS postal_code,
+            COALESCE(snap.latitude,     sa.latitude,  ra.latitude)  AS latitude,
+            COALESCE(snap.longitude,    sa.longitude, ra.longitude) AS longitude,
+            p.number                                              AS phone,
+            snap.schedule,
+            snap.category_names,
+            snap.sfsg_category_names,
+            snap.eligibility_age,
+            snap.eligibility_employment,
+            snap.eligibility_ethnicity,
+            snap.eligibility_family_status,
+            snap.eligibility_financial,
+            snap.eligibility_gender,
+            snap.eligibility_health,
+            snap.eligibility_immigration,
+            snap.eligibility_housing,
+            snap.eligibility_other,
+            snap.eligibility_all,
+            snap.embedding_text
+        FROM services s
+        JOIN resources r ON r.id = s.resource_id
+        LEFT JOIN {settings.pgvector_table} snap ON snap.service_id = s.id
+        LEFT JOIN LATERAL (
+            SELECT a.address_1, a.city, a.state_province, a.postal_code,
+                   a.latitude, a.longitude
+            FROM addresses a
+            JOIN addresses_services ads ON a.id = ads.address_id
+            WHERE ads.service_id = s.id
+            ORDER BY a.id
+            LIMIT 1
+        ) sa ON true
+        LEFT JOIN LATERAL (
+            SELECT address_1, city, state_province, postal_code,
+                   latitude, longitude
+            FROM addresses
+            WHERE resource_id = r.id
+            ORDER BY id
+            LIMIT 1
+        ) ra ON true
+        LEFT JOIN LATERAL (
+            SELECT number
+            FROM phones
+            WHERE resource_id = r.id
+            ORDER BY id
+            LIMIT 1
+        ) p ON true
+        WHERE {where_clause}
+    """
 
 
 def _parse_when(when: str) -> tuple[str, int] | None:
@@ -221,11 +287,13 @@ async def list_eligibilities() -> dict[str, list[str]]:
 
 async def get_service_details_batch(service_ids: list[int]) -> list[dict]:
     """
-    Returns card-level details for a batch of services by their service_ids.
-    Each result includes: service_id, name, long_description, org_name,
-    address_1, city, state_province, postal_code, latitude, longitude, phone.
-    Address prefers service-level (via addresses_services join table), falling
-    back to resource-level. Phone is the first phone on the resource.
+    Returns full per-service details for a batch of service_ids. Each result
+    has the unified detail shape: service_id, name, long_description,
+    resource_id, org_name, address_1, city, state_province, postal_code,
+    latitude, longitude, phone, schedule, category_names, sfsg_category_names,
+    eligibility_*, embedding_text. Address prefers service-level (via
+    addresses_services), falling back to resource-level. Phone is the first
+    phone on the resource. Same shape as get_service_details (singular).
     """
     if not service_ids:
         return []
@@ -233,51 +301,8 @@ async def get_service_details_batch(service_ids: list[int]) -> list[dict]:
     logger.info(f"get_service_details_batch: {len(service_ids)} service_ids")
     pool = await get_pool()
 
-    sql = """
-        SELECT
-            s.id                                                AS service_id,
-            s.name,
-            s.long_description,
-            r.id                                                AS resource_id,
-            r.name                                              AS org_name,
-            COALESCE(sa.address_1,    ra.address_1)            AS address_1,
-            COALESCE(sa.city,         ra.city)                 AS city,
-            COALESCE(sa.state_province, ra.state_province)     AS state_province,
-            COALESCE(sa.postal_code,  ra.postal_code)          AS postal_code,
-            COALESCE(sa.latitude,     ra.latitude)             AS latitude,
-            COALESCE(sa.longitude,    ra.longitude)            AS longitude,
-            p.number                                            AS phone
-        FROM services s
-        JOIN resources r ON r.id = s.resource_id
-        LEFT JOIN LATERAL (
-            SELECT a.address_1, a.city, a.state_province, a.postal_code,
-                   a.latitude, a.longitude
-            FROM addresses a
-            JOIN addresses_services ads ON a.id = ads.address_id
-            WHERE ads.service_id = s.id
-            ORDER BY a.id
-            LIMIT 1
-        ) sa ON true
-        LEFT JOIN LATERAL (
-            SELECT address_1, city, state_province, postal_code,
-                   latitude, longitude
-            FROM addresses
-            WHERE resource_id = r.id
-            ORDER BY id
-            LIMIT 1
-        ) ra ON true
-        LEFT JOIN LATERAL (
-            SELECT number
-            FROM phones
-            WHERE resource_id = r.id
-            ORDER BY id
-            LIMIT 1
-        ) p ON true
-        WHERE s.id = ANY($1::int[])
-    """
-
     async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, service_ids)
+        rows = await conn.fetch(_build_detail_sql("s.id = ANY($1::int[])"), service_ids)
 
     results = [dict(r) for r in rows]
     logger.info(f"get_service_details_batch: returned {len(results)} results")
@@ -286,24 +311,18 @@ async def get_service_details_batch(service_ids: list[int]) -> list[dict]:
 
 async def get_service_details(service_id: int) -> dict | None:
     """
-    Returns full details for a specific service by its service_id, including
-    the prose description used for search. Use this after search_services to
-    surface complete information about a specific result.
+    Returns full details for a specific service by its service_id. Same
+    unified shape as get_service_details_batch — card fields (name, org_name,
+    address, phone), filter fields (category_names, eligibility_*, schedule),
+    and the prose description (embedding_text, long_description). Use this
+    after search_services to surface complete information about a specific
+    result.
     """
     logger.info(f"get_service_details: service_id={service_id}")
     pool = await get_pool()
 
-    fields = ", ".join(_DETAIL_FIELDS)
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            f"""
-            SELECT {fields}
-            FROM {settings.pgvector_table}
-            WHERE service_id = $1
-            LIMIT 1
-            """,
-            service_id,
-        )
+        row = await conn.fetchrow(_build_detail_sql("s.id = $1 LIMIT 1"), service_id)
 
     if row is None:
         logger.warning(f"get_service_details: service_id={service_id} not found")
