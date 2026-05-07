@@ -366,41 +366,77 @@ async def get_service_details_batch(service_ids: list[int]) -> list[dict]:
     return results
 
 
-async def search_by_name(name: str, limit: int = 50) -> list[dict]:
+_SEARCH_BY_NAME_LIMIT = 50
+
+
+async def search_by_name(name: str) -> list[dict]:
     """
     Look up services by organization or service name using a case-insensitive
     partial match. Use this first when the navigator asks about a specific
     named org (e.g. "Glide", "Compass Family", "St. Anthony's", "YMCA").
-    Returns up to `limit` results with the same unified detail shape as
-    get_service_details / get_service_details_batch, sorted by match quality
-    (exact org name → prefix match → substring match).
+    Returns up to 50 results with the same unified detail shape as
+    get_service_details / get_service_details_batch.
 
-    Default `limit` is 50 to match search_services' cap. Multi-location
-    orgs (YMCA, Catholic Charities, etc.) can have many services across
-    branches; a smaller cap clusters results into the alphabetically-first
-    branch and drops the rest.
+    Results are ranked **round-robin across resources**: the first row from
+    each matching resource appears before the second row from any resource,
+    and so on. So a query for "YMCA" returns one service from each YMCA
+    branch first (one Bayview, one Chinatown, one Mission, ...) before
+    going deeper into any single branch. This guarantees a query for a
+    multi-location org surfaces every distinct branch in the response.
+
+    Within each "depth" (rn=1, rn=2, ...), branches are ordered by match
+    quality (exact org name → prefix match → substring match) and then
+    alphabetical resource name as tiebreaker.
+
+    `limit` is fixed at 50 server-side and not exposed as a parameter —
+    callers (LLMs especially) shouldn't be able to under-cap the response.
     """
-    logger.info(f"search_by_name: name='{name}', limit={limit}")
+    logger.info(f"search_by_name: name='{name}'")
     pool = await get_pool()
 
-    tail = """
+    inner_sql = _build_detail_sql("""
         WHERE r.name ILIKE '%' || $1 || '%'
            OR s.name ILIKE '%' || $1 || '%'
-        ORDER BY
-            CASE
-                WHEN r.name ILIKE $1        THEN 0
-                WHEN r.name ILIKE $1 || '%' THEN 1
-                WHEN r.name ILIKE '%' || $1 || '%' THEN 2
-                ELSE 3
-            END,
-            r.name, s.name
-        LIMIT $2
+    """)
+
+    # Window-function wrapper for round-robin ranking. rn_per_resource
+    # counts each row's depth within its resource (1 = first row from that
+    # resource, 2 = second, etc). resource_rank ranks resources globally by
+    # match quality + alphabetical name. Ordering by (rn_per_resource,
+    # resource_rank) interleaves depth-1 rows from every resource before
+    # any depth-2 row.
+    sql = f"""
+    SELECT *
+    FROM (
+        SELECT *,
+            ROW_NUMBER() OVER (
+                PARTITION BY resource_id
+                ORDER BY service_id
+            ) AS rn_per_resource,
+            DENSE_RANK() OVER (
+                ORDER BY
+                    CASE
+                        WHEN org_name ILIKE $1        THEN 0
+                        WHEN org_name ILIKE $1 || '%' THEN 1
+                        WHEN org_name ILIKE '%' || $1 || '%' THEN 2
+                        ELSE 3
+                    END,
+                    org_name
+            ) AS resource_rank
+        FROM ({inner_sql}) base
+    ) ranked
+    ORDER BY rn_per_resource, resource_rank
+    LIMIT {_SEARCH_BY_NAME_LIMIT}
     """
 
     async with pool.acquire() as conn:
-        rows = await conn.fetch(_build_detail_sql(tail), name, limit)
+        rows = await conn.fetch(sql, name)
 
     results = [dict(r) for r in rows]
+    # Strip helper columns before returning to callers.
+    for r in results:
+        r.pop("rn_per_resource", None)
+        r.pop("resource_rank", None)
     logger.info(f"search_by_name: returned {len(results)} results for '{name}'")
     return results
 
