@@ -48,6 +48,9 @@ def _build_detail_sql(tail: str) -> str:
             s.id                                                  AS service_id,
             s.name,
             s.long_description,
+            s.email,
+            s.url,
+            s.application_process,
             r.id                                                  AS resource_id,
             r.name                                                AS org_name,
             COALESCE(sa.address_1,      ra.address_1)            AS address_1,
@@ -57,6 +60,7 @@ def _build_detail_sql(tail: str) -> str:
             COALESCE(snap.latitude,     sa.latitude,  ra.latitude)  AS latitude,
             COALESCE(snap.longitude,    sa.longitude, ra.longitude) AS longitude,
             p.number                                              AS phone,
+            n.notes,
             snap.schedule,
             snap.category_names,
             snap.sfsg_category_names,
@@ -99,6 +103,13 @@ def _build_detail_sql(tail: str) -> str:
             ORDER BY id
             LIMIT 1
         ) p ON true
+        LEFT JOIN LATERAL (
+            SELECT array_agg(note ORDER BY created_at DESC) AS notes
+            FROM notes
+            WHERE (service_id = s.id OR resource_id = r.id)
+              AND note IS NOT NULL
+              AND btrim(note) <> ''
+        ) n ON true
         {tail}
     """
 
@@ -291,12 +302,14 @@ async def list_eligibilities() -> dict[str, list[str]]:
 async def get_service_details_batch(service_ids: list[int]) -> list[dict]:
     """
     Returns full per-service details for a batch of service_ids. Each result
-    has the unified detail shape: service_id, name, long_description,
-    resource_id, org_name, address_1, city, state_province, postal_code,
-    latitude, longitude, phone, schedule, category_names, sfsg_category_names,
-    eligibility_*, embedding_text. Address prefers service-level (via
-    addresses_services), falling back to resource-level. Phone is the first
-    phone on the resource. Same shape as get_service_details (singular).
+    has the unified detail shape: service_id, name, long_description, email,
+    url, application_process, resource_id, org_name, address_1, city,
+    state_province, postal_code, latitude, longitude, phone, notes (text[]
+    aggregated from both service-level and resource-level rows in the notes
+    table), schedule, category_names, sfsg_category_names, eligibility_*,
+    embedding_text. Address prefers service-level (via addresses_services),
+    falling back to resource-level. Phone is the first phone on the resource.
+    Same shape as get_service_details (singular).
     """
     if not service_ids:
         return []
