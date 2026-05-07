@@ -45,22 +45,41 @@ def _build_detail_sql(tail: str) -> str:
     """
     return f"""
         SELECT
+            -- Service identity
             s.id                                                  AS service_id,
             s.name,
+            s.alternate_name,
+            s.short_description,
             s.long_description,
-            s.email,
-            s.url,
+            -- Service operational fields (previously only in embedding_text prose)
+            s.eligibility                                         AS eligibility_text,
+            s.fee,
+            s.wait_time,
+            s.required_documents,
+            s.interpretation_services,
             s.application_process,
+            -- Contact channels — fall back to resource-level if absent on service
+            COALESCE(s.email,   r.email)                          AS email,
+            COALESCE(s.url,     r.website)                        AS url,
+            -- Resource (organization) identity + descriptions
             r.id                                                  AS resource_id,
             r.name                                                AS org_name,
+            r.alternate_name                                      AS org_alternate_name,
+            r.short_description                                   AS org_short_description,
+            r.long_description                                    AS org_long_description,
+            r.legal_status,
+            -- Address (service-level then resource-level fallback)
             COALESCE(sa.address_1,      ra.address_1)            AS address_1,
             COALESCE(sa.city,           ra.city)                 AS city,
             COALESCE(sa.state_province, ra.state_province)       AS state_province,
             COALESCE(sa.postal_code,    ra.postal_code)          AS postal_code,
             COALESCE(snap.latitude,     sa.latitude,  ra.latitude)  AS latitude,
             COALESCE(snap.longitude,    sa.longitude, ra.longitude) AS longitude,
+            -- Phone (first on resource)
             p.number                                              AS phone,
+            -- Notes (text[]; aggregated from polymorphic notes table)
             n.notes,
+            -- Snapshot fields used for filtering / search
             snap.schedule,
             snap.category_names,
             snap.sfsg_category_names,
@@ -74,8 +93,12 @@ def _build_detail_sql(tail: str) -> str:
             snap.eligibility_immigration,
             snap.eligibility_housing,
             snap.eligibility_other,
-            snap.eligibility_all,
-            snap.embedding_text
+            snap.eligibility_all
+            -- embedding_text deliberately excluded: every prose field it contains
+            -- is now exposed as a structured column. Returning the prose blob too
+            -- would be ~30-50% wasted bytes per row. The blob still exists in the
+            -- snapshot table for vector similarity (search_services uses it
+            -- internally); we just don't ship it to detail consumers anymore.
         FROM services s
         JOIN resources r ON r.id = s.resource_id
         LEFT JOIN {settings.pgvector_table} snap ON snap.service_id = s.id
@@ -302,14 +325,32 @@ async def list_eligibilities() -> dict[str, list[str]]:
 async def get_service_details_batch(service_ids: list[int]) -> list[dict]:
     """
     Returns full per-service details for a batch of service_ids. Each result
-    has the unified detail shape: service_id, name, long_description, email,
-    url, application_process, resource_id, org_name, address_1, city,
-    state_province, postal_code, latitude, longitude, phone, notes (text[]
-    aggregated from both service-level and resource-level rows in the notes
-    table), schedule, category_names, sfsg_category_names, eligibility_*,
-    embedding_text. Address prefers service-level (via addresses_services),
-    falling back to resource-level. Phone is the first phone on the resource.
-    Same shape as get_service_details (singular).
+    has the unified detail shape — see _build_detail_sql for the canonical
+    list of columns. Highlights:
+
+      Service identity & prose: service_id, name, alternate_name,
+        short_description, long_description.
+      Service operational: eligibility_text (free-text), fee, wait_time,
+        required_documents, interpretation_services, application_process.
+      Contact: email, url (both with service → resource fallback), phone
+        (first on resource).
+      Resource identity & prose: resource_id, org_name, org_alternate_name,
+        org_short_description, org_long_description, legal_status.
+      Address: address_1, city, state_province, postal_code, latitude,
+        longitude (service-level then resource-level fallback).
+      Notes: notes (text[]), aggregated from both service- and resource-
+        level rows in the notes table.
+      Filtering: schedule, category_names, sfsg_category_names,
+        eligibility_age / employment / ethnicity / family_status /
+        financial / gender / health / immigration / housing / other / all.
+
+    embedding_text is no longer included — every prose field it contained
+    is now exposed as a structured column. The blob still lives in the
+    snapshot table for vector similarity search; it just isn't shipped to
+    detail consumers anymore.
+
+    Same shape as get_service_details (singular) and search_by_name —
+    they share _build_detail_sql.
     """
     if not service_ids:
         return []
