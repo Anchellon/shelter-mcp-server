@@ -325,14 +325,19 @@ async def get_service_details_batch(service_ids: list[int]) -> list[dict]:
     return results
 
 
-async def search_by_name(name: str, limit: int = 10) -> list[dict]:
+async def search_by_name(name: str, limit: int = 50) -> list[dict]:
     """
     Look up services by organization or service name using a case-insensitive
     partial match. Use this first when the navigator asks about a specific
-    named org (e.g. "Glide", "Compass Family", "St. Anthony's").
+    named org (e.g. "Glide", "Compass Family", "St. Anthony's", "YMCA").
     Returns up to `limit` results with the same unified detail shape as
     get_service_details / get_service_details_batch, sorted by match quality
     (exact org name → prefix match → substring match).
+
+    Default `limit` is 50 to match search_services' cap. Multi-location
+    orgs (YMCA, Catholic Charities, etc.) can have many services across
+    branches; a smaller cap clusters results into the alphabetically-first
+    branch and drops the rest.
     """
     logger.info(f"search_by_name: name='{name}', limit={limit}")
     pool = await get_pool()
